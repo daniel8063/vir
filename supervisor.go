@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -71,6 +72,108 @@ var scannerBufPool = sync.Pool{
 var pumpLogMu sync.Mutex
 var pumpNewline = [1]byte{'\n'}
 
+// prepareRuntimeConfig injects Cloudflare WARP into runtime config if WARP_SECRET_KEY is present.
+func prepareRuntimeConfig(baseCfg string) string {
+	warpKey := strings.TrimSpace(os.Getenv("WARP_SECRET_KEY"))
+	if warpKey == "" {
+		log.Printf("[Supervisor] WARP_SECRET_KEY not set; using baseline config: %s", baseCfg)
+		return baseCfg
+	}
+
+	raw, err := os.ReadFile(baseCfg)
+	if err != nil {
+		log.Printf("[Supervisor] Warning: cannot read base config %s: %v", baseCfg, err)
+		return baseCfg
+	}
+
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		log.Printf("[Supervisor] Warning: invalid base config JSON: %v", err)
+		return baseCfg
+	}
+
+	addrEnv := getEnv("WARP_ADDRESS", "172.16.0.2/32")
+	var addrs []string
+	for _, a := range strings.Split(addrEnv, ",") {
+		if s := strings.TrimSpace(a); s != "" {
+			addrs = append(addrs, s)
+		}
+	}
+	if len(addrs) == 0 {
+		addrs = []string{"172.16.0.2/32"}
+	}
+
+	resEnv := getEnv("WARP_RESERVED", "0,0,0")
+	var res []int
+	for _, r := range strings.Split(resEnv, ",") {
+		if n, err := strconv.Atoi(strings.TrimSpace(r)); err == nil {
+			res = append(res, n)
+		}
+	}
+	if len(res) != 3 {
+		res = []int{0, 0, 0}
+	}
+
+	warpOutbound := map[string]any{
+		"tag":      "warp-out",
+		"protocol": "wireguard",
+		"settings": map[string]any{
+			"secretKey": warpKey,
+			"address":   addrs,
+			"peers": []any{
+				map[string]any{
+					"publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+					"endpoint":  "engage.cloudflareclient.com:2408",
+				},
+			},
+			"reserved": res,
+		},
+	}
+
+	outbounds, _ := cfg["outbounds"].([]any)
+	found := false
+	for i, ob := range outbounds {
+		if m, ok := ob.(map[string]any); ok && m["tag"] == "warp-out" {
+			outbounds[i] = warpOutbound
+			found = true
+			break
+		}
+	}
+	if !found {
+		outbounds = append(outbounds, warpOutbound)
+	}
+	cfg["outbounds"] = outbounds
+
+	if routing, ok := cfg["routing"].(map[string]any); ok {
+		if rules, ok := routing["rules"].([]any); ok {
+			for _, r := range rules {
+				if rm, ok := r.(map[string]any); ok {
+					if _, hasUser := rm["user"]; hasUser {
+						rm["outboundTag"] = "warp-out"
+					} else if netStr, _ := rm["network"].(string); netStr == "tcp,udp" && rm["outboundTag"] == "direct-ipv4" {
+						rm["outboundTag"] = "warp-out"
+					}
+				}
+			}
+		}
+	}
+
+	outData, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		log.Printf("[Supervisor] Warning: cannot marshal mutated config: %v", err)
+		return baseCfg
+	}
+
+	targetPath := "/tmp/config.json"
+	if err := os.WriteFile(targetPath, outData, 0644); err != nil {
+		log.Printf("[Supervisor] Warning: cannot write %s: %v", targetPath, err)
+		return baseCfg
+	}
+
+	log.Printf("[Supervisor] Injected Cloudflare WARP egress into runtime config: %s", targetPath)
+	return targetPath
+}
+
 // SupervisorHealthSnapshot captures an atomic telemetry state of the child daemon.
 type SupervisorHealthSnapshot struct {
 	Running     bool   `json:"running"`
@@ -91,7 +194,6 @@ type childExit struct {
 }
 
 // processReaper establishes an event-driven wait4(-1) dispatcher.
-// Eliminates race conditions with exec.Cmd and reaps adopted grandchildren natively.
 type processReaper struct {
 	mu      sync.Mutex
 	waiters map[int]chan childExit
@@ -204,6 +306,9 @@ func NewSupervisor() *Supervisor {
 	bin := getEnv("BERMUDA_XRAY_BIN", defaultXrayBin)
 	cfg := getEnv("BERMUDA_XRAY_CONFIG", defaultConfigPath)
 	assets := getEnv("XRAY_LOCATION_ASSET", defaultAssetDir)
+
+	// Dynamically prepare runtime configuration based on environment variables
+	cfg = prepareRuntimeConfig(cfg)
 
 	dialer := &net.Dialer{
 		Timeout:   probeDialTimeout,
