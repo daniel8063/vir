@@ -72,7 +72,7 @@ var scannerBufPool = sync.Pool{
 var pumpLogMu sync.Mutex
 var pumpNewline = [1]byte{'\n'}
 
-// prepareRuntimeConfig injects Cloudflare WARP into runtime config if WARP_SECRET_KEY is present.
+// prepareRuntimeConfig injects Cloudflare WARP and optimizes DNS into runtime config.
 func prepareRuntimeConfig(baseCfg string) string {
 	warpKey := strings.TrimSpace(os.Getenv("WARP_SECRET_KEY"))
 	warpKey = strings.TrimPrefix(warpKey, "PrivateKey =")
@@ -122,11 +122,14 @@ func prepareRuntimeConfig(baseCfg string) string {
 
 	warpEndpoint := getEnv("WARP_ENDPOINT", "162.159.192.1:2408")
 
+	// بهینه‌سازی تنظیمات وایرگارد برای رزولوشن سریع دامنه‌ها
 	warpSettings := map[string]any{
-		"secretKey":   warpKey,
-		"address":     addrs,
-		"noKernelTun": true,
-		"mtu":         1280,
+		"secretKey":      warpKey,
+		"address":        addrs,
+		"noKernelTun":    true,
+		"mtu":            1280,
+		"domainStrategy": "ForceIPv4",
+		"remoteDNS":      []string{"1.1.1.1", "1.0.0.1"},
 		"peers": []any{
 			map[string]any{
 				"publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
@@ -161,7 +164,20 @@ func prepareRuntimeConfig(baseCfg string) string {
 	}
 	cfg["outbounds"] = outbounds
 
-	// فقط ترافیک کلاینت‌های احراز هویت شده را به وارپ بفرست و روتینگ سیستم/DNS را دست‌نخورده نگه دار
+	// بهینه‌سازی سرور DNS داخلی هسته به سرورهای پرسرعت با قابلیت Fallback
+	cfg["dns"] = map[string]any{
+		"servers": []any{
+			"1.1.1.1",
+			"8.8.8.8",
+			"1.0.0.1",
+			"https://1.1.1.1/dns-query",
+		},
+		"queryStrategy":   "UseIPv4",
+		"disableCache":    false,
+		"disableFallback": false,
+	}
+
+	// فقط ترافیک کلاینت‌ها به وارپ هدایت شود و DNS مستقیم کار کند
 	if routing, ok := cfg["routing"].(map[string]any); ok {
 		if rules, ok := routing["rules"].([]any); ok {
 			for _, r := range rules {
