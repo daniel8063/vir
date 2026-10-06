@@ -110,39 +110,41 @@ func prepareRuntimeConfig(baseCfg string) string {
 		addrs = []string{"172.16.0.2/32"}
 	}
 
-	resEnv := getEnv("WARP_RESERVED", "0,0,0")
-	resEnv = strings.Trim(resEnv, "[] \t\"'")
+	resEnv := strings.Trim(getEnv("WARP_RESERVED", ""), "[] \t\"'")
 	var res []int
-	for _, r := range strings.Split(resEnv, ",") {
-		if n, err := strconv.Atoi(strings.TrimSpace(r)); err == nil {
-			res = append(res, n)
+	if resEnv != "" {
+		for _, r := range strings.Split(resEnv, ",") {
+			if n, err := strconv.Atoi(strings.TrimSpace(r)); err == nil {
+				res = append(res, n)
+			}
 		}
 	}
-	if len(res) != 3 {
-		res = []int{0, 0, 0}
+
+	warpEndpoint := getEnv("WARP_ENDPOINT", "162.159.192.1:2408")
+
+	warpSettings := map[string]any{
+		"secretKey":   warpKey,
+		"address":     addrs,
+		"noKernelTun": true,
+		"mtu":         1280,
+		"peers": []any{
+			map[string]any{
+				"publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+				"endpoint":   warpEndpoint,
+				"allowedIPs": []string{"0.0.0.0/0", "::/0"},
+				"keepAlive":  25,
+			},
+		},
 	}
 
-	// Cloudflare Anycast IPv4 endpoint prevents circular DNS resolution deadlocks and IPv6 UDP drops on Railway.
-	warpEndpoint := getEnv("WARP_ENDPOINT", "162.159.192.1:2408")
+	if len(res) == 3 {
+		warpSettings["reserved"] = res
+	}
 
 	warpOutbound := map[string]any{
 		"tag":      "warp-out",
 		"protocol": "wireguard",
-		"settings": map[string]any{
-			"secretKey":   warpKey,
-			"address":     addrs,
-			"noKernelTun": true, // Essential: enables userspace gVisor stack for unprivileged rootless container.
-			"mtu":         1280, // Cloudflare WARP standard MTU.
-			"peers": []any{
-				map[string]any{
-					"publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-					"endpoint":   warpEndpoint,
-					"allowedIPs": []string{"0.0.0.0/0", "::/0"}, // Required: Cryptokey routing for all internet destinations.
-					"keepAlive":  25,
-				},
-			},
-			"reserved": res,
-		},
+		"settings": warpSettings,
 	}
 
 	outbounds, _ := cfg["outbounds"].([]any)
@@ -159,13 +161,12 @@ func prepareRuntimeConfig(baseCfg string) string {
 	}
 	cfg["outbounds"] = outbounds
 
+	// فقط ترافیک کلاینت‌های احراز هویت شده را به وارپ بفرست و روتینگ سیستم/DNS را دست‌نخورده نگه دار
 	if routing, ok := cfg["routing"].(map[string]any); ok {
 		if rules, ok := routing["rules"].([]any); ok {
 			for _, r := range rules {
 				if rm, ok := r.(map[string]any); ok {
 					if _, hasUser := rm["user"]; hasUser {
-						rm["outboundTag"] = "warp-out"
-					} else if netStr, _ := rm["network"].(string); netStr == "tcp,udp" && rm["outboundTag"] == "direct-ipv4" {
 						rm["outboundTag"] = "warp-out"
 					}
 				}
@@ -185,7 +186,7 @@ func prepareRuntimeConfig(baseCfg string) string {
 		return baseCfg
 	}
 
-	log.Printf("[Supervisor] Injected Cloudflare WARP egress into runtime config: %s (endpoint=%s, noKernelTun=true)", targetPath, warpEndpoint)
+	log.Printf("[Supervisor] Injected Cloudflare WARP egress into runtime config: %s (endpoint=%s, reserved=%v)", targetPath, warpEndpoint, res)
 	return targetPath
 }
 
@@ -322,7 +323,6 @@ func NewSupervisor() *Supervisor {
 	cfg := getEnv("BERMUDA_XRAY_CONFIG", defaultConfigPath)
 	assets := getEnv("XRAY_LOCATION_ASSET", defaultAssetDir)
 
-	// Dynamically prepare runtime configuration based on environment variables
 	cfg = prepareRuntimeConfig(cfg)
 
 	dialer := &net.Dialer{
