@@ -75,6 +75,10 @@ var pumpNewline = [1]byte{'\n'}
 // prepareRuntimeConfig injects Cloudflare WARP into runtime config if WARP_SECRET_KEY is present.
 func prepareRuntimeConfig(baseCfg string) string {
 	warpKey := strings.TrimSpace(os.Getenv("WARP_SECRET_KEY"))
+	warpKey = strings.TrimPrefix(warpKey, "PrivateKey =")
+	warpKey = strings.TrimPrefix(warpKey, "PrivateKey=")
+	warpKey = strings.Trim(warpKey, " \"'")
+
 	if warpKey == "" {
 		log.Printf("[Supervisor] WARP_SECRET_KEY not set; using baseline config: %s", baseCfg)
 		return baseCfg
@@ -94,9 +98,12 @@ func prepareRuntimeConfig(baseCfg string) string {
 
 	addrEnv := getEnv("WARP_ADDRESS", "172.16.0.2/32")
 	var addrs []string
-	for _, a := range strings.Split(addrEnv, ",") {
-		if s := strings.TrimSpace(a); s != "" {
-			addrs = append(addrs, s)
+	for _, chunk := range strings.FieldsFunc(addrEnv, func(r rune) bool {
+		return r == ',' || r == '\n' || r == '\r' || r == ' ' || r == '\t'
+	}) {
+		chunk = strings.TrimSpace(chunk)
+		if chunk != "" {
+			addrs = append(addrs, chunk)
 		}
 	}
 	if len(addrs) == 0 {
@@ -104,6 +111,7 @@ func prepareRuntimeConfig(baseCfg string) string {
 	}
 
 	resEnv := getEnv("WARP_RESERVED", "0,0,0")
+	resEnv = strings.Trim(resEnv, "[] \t\"'")
 	var res []int
 	for _, r := range strings.Split(resEnv, ",") {
 		if n, err := strconv.Atoi(strings.TrimSpace(r)); err == nil {
@@ -114,16 +122,23 @@ func prepareRuntimeConfig(baseCfg string) string {
 		res = []int{0, 0, 0}
 	}
 
+	// Cloudflare Anycast IPv4 endpoint prevents circular DNS resolution deadlocks and IPv6 UDP drops on Railway.
+	warpEndpoint := getEnv("WARP_ENDPOINT", "162.159.192.1:2408")
+
 	warpOutbound := map[string]any{
 		"tag":      "warp-out",
 		"protocol": "wireguard",
 		"settings": map[string]any{
-			"secretKey": warpKey,
-			"address":   addrs,
+			"secretKey":   warpKey,
+			"address":     addrs,
+			"noKernelTun": true, // Essential: enables userspace gVisor stack for unprivileged rootless container.
+			"mtu":         1280, // Cloudflare WARP standard MTU.
 			"peers": []any{
 				map[string]any{
-					"publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
-					"endpoint":  "engage.cloudflareclient.com:2408",
+					"publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+					"endpoint":   warpEndpoint,
+					"allowedIPs": []string{"0.0.0.0/0", "::/0"}, // Required: Cryptokey routing for all internet destinations.
+					"keepAlive":  25,
 				},
 			},
 			"reserved": res,
@@ -170,7 +185,7 @@ func prepareRuntimeConfig(baseCfg string) string {
 		return baseCfg
 	}
 
-	log.Printf("[Supervisor] Injected Cloudflare WARP egress into runtime config: %s", targetPath)
+	log.Printf("[Supervisor] Injected Cloudflare WARP egress into runtime config: %s (endpoint=%s, noKernelTun=true)", targetPath, warpEndpoint)
 	return targetPath
 }
 
